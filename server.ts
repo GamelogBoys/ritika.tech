@@ -9,7 +9,7 @@ import nodemailer from "nodemailer";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
-const app = express();
+export const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: "50mb" }));
@@ -980,16 +980,26 @@ app.post("/api/admin/add-announcement", async (req, res) => {
 });
 
 // --- Boot Server & Establish Connections gracefully ---
-async function startServer() {
+let mongoosePromise: Promise<typeof mongoose> | null = null;
+
+export async function ensureMongoDbConnected() {
   const MONGODB_URI = process.env.MONGODB_URI;
-  if (MONGODB_URI) {
+  if (!MONGODB_URI) {
+    return false;
+  }
+
+  if (mongoose.connection.readyState >= 1) {
+    isMongoConnected = true;
+    return true;
+  }
+
+  if (!mongoosePromise) {
     mongoose.set("strictQuery", false);
-    // Attempt connection in background with a fail-fast timeout so startup is never blocked
-    mongoose.connect(MONGODB_URI, {
-      serverSelectionTimeoutMS: 4000
-    }).then(async () => {
+    mongoosePromise = mongoose.connect(MONGODB_URI, {
+      serverSelectionTimeoutMS: 5000
+    }).then(async (m) => {
       isMongoConnected = true;
-      console.log(">>> MongoDB Atlas connected successfully!");
+      console.log(">>> MongoDB Atlas connected successfully (on-demand)!");
 
       try {
         const db = loadDB();
@@ -1074,10 +1084,37 @@ async function startServer() {
       } catch (seedErr) {
         console.warn(">>> MongoDB Seeding completed with warnings:", seedErr);
       }
+      return m;
     }).catch((err) => {
       console.error(">>> Error connecting to MongoDB Atlas! Falling back to file-based cache to remain stable. Error:", err);
       isMongoConnected = false;
+      mongoosePromise = null;
+      throw err;
     });
+  }
+
+  await mongoosePromise;
+  return true;
+}
+
+// Global Express middleware to ensure database connection on incoming API requests in serverless scope
+app.use(async (req, res, next) => {
+  try {
+    await ensureMongoDbConnected();
+  } catch (err) {
+    console.warn(">>> Database connection auto-check warning:", err.message || err);
+  }
+  next();
+});
+
+async function startServer() {
+  const MONGODB_URI = process.env.MONGODB_URI;
+  if (MONGODB_URI) {
+    try {
+      await ensureMongoDbConnected();
+    } catch (e) {
+      // Ignored: already reported
+    }
   } else {
     console.log(">>> MONGODB_URI environment variable is unspecified. Using locally backed up cache: db-store.json.");
   }
@@ -1102,4 +1139,6 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.env.NETLIFY !== "true") {
+  startServer();
+}
