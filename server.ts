@@ -3,7 +3,6 @@ dotenv.config({ override: true });
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 import mongoose from "mongoose";
 import nodemailer from "nodemailer";
 import bcrypt from "bcryptjs";
@@ -981,26 +980,46 @@ app.post("/api/admin/add-announcement", async (req, res) => {
 
 // --- Boot Server & Establish Connections gracefully ---
 let mongoosePromise: Promise<typeof mongoose> | null = null;
+let isMigrated = false;
 
 export async function ensureMongoDbConnected() {
   const MONGODB_URI = process.env.MONGODB_URI;
   if (!MONGODB_URI) {
+    isMongoConnected = false;
     return false;
   }
 
-  if (mongoose.connection.readyState >= 1) {
+  // State 1 is connected
+  if (mongoose.connection.readyState === 1) {
     isMongoConnected = true;
     return true;
   }
 
-  if (!mongoosePromise) {
-    mongoose.set("strictQuery", false);
-    mongoosePromise = mongoose.connect(MONGODB_URI, {
-      serverSelectionTimeoutMS: 5000
-    }).then(async (m) => {
+  // If currently connecting (state 2), let's wait for the existing promise
+  if (mongoosePromise) {
+    try {
+      await mongoosePromise;
       isMongoConnected = true;
-      console.log(">>> MongoDB Atlas connected successfully (on-demand)!");
+      return true;
+    } catch (err) {
+      isMongoConnected = false;
+      throw err;
+    }
+  }
 
+  mongoose.set("strictQuery", false);
+  mongoosePromise = mongoose.connect(MONGODB_URI, {
+    serverSelectionTimeoutMS: 5000
+  });
+
+  try {
+    await mongoosePromise;
+    isMongoConnected = true;
+    console.log(">>> MongoDB Atlas connected successfully (on-demand)!");
+
+    // Run proactive migration/seeding exactly once per container instance
+    if (!isMigrated) {
+      isMigrated = true;
       try {
         const db = loadDB();
 
@@ -1084,17 +1103,15 @@ export async function ensureMongoDbConnected() {
       } catch (seedErr) {
         console.warn(">>> MongoDB Seeding completed with warnings:", seedErr);
       }
-      return m;
-    }).catch((err) => {
-      console.error(">>> Error connecting to MongoDB Atlas! Falling back to file-based cache to remain stable. Error:", err);
-      isMongoConnected = false;
-      mongoosePromise = null;
-      throw err;
-    });
-  }
+    }
 
-  await mongoosePromise;
-  return true;
+    return true;
+  } catch (err) {
+    console.error(">>> Error connecting to MongoDB Atlas! Falling back to cache. Error:", err);
+    isMongoConnected = false;
+    mongoosePromise = null;
+    throw err;
+  }
 }
 
 // Global Express middleware to ensure database connection on incoming API requests in serverless scope
@@ -1121,6 +1138,7 @@ async function startServer() {
 
   // Vite integration 
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
